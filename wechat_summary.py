@@ -25,7 +25,7 @@ BASE_API_URL = os.environ["BASE_API_URL"]
 import subprocess
 
 def resolve_group_id(keyword):
-    """通过关键字搜索获取群聊 ID (username)"""
+    """通过关键字搜索获取群聊 ID (username)，要求群名完全匹配"""
     endpoint = f"{BASE_API_URL}/contacts"
     try:
         params = {"keyword": keyword}
@@ -34,14 +34,19 @@ def resolve_group_id(keyword):
             data = response.json()
             # 根据 API 文档，联系人列表在 data["contacts"] 中
             contacts = data.get("contacts", [])
-            if contacts and len(contacts) > 0:
-                # 优先返回匹配的群聊 (@chatroom)
+            if contacts:
+                # 遍历结果，寻找完全匹配群名的群聊
                 for contact in contacts:
-                    if "@chatroom" in contact.get("username", ""):
-                        return contact.get("username")
-                # 如果没找到群聊，返回第一个匹配项
-                return contacts[0].get("username")
-        logger.error(f"未找到群聊: {keyword}, 状态码: {response.status_code}")
+                    username = contact.get("username", "")
+                    display_name = contact.get("displayName", "")
+                    # 条件：必须是群聊 (@chatroom) 且 群名 (displayName) 完全一致
+                    if "@chatroom" in username and display_name == keyword:
+                        logger.info(f"成功匹配群聊: {display_name} ({username})")
+                        return username
+
+                logger.warning(f"搜索到匹配项但未找到完全匹配的群聊: {keyword}")
+        else:
+            logger.error(f"搜索接口返回错误: {response.status_code}")
     except Exception as e:
         logger.error(f"搜索群聊异常: {e}")
     return None
