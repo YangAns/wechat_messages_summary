@@ -1,0 +1,9 @@
+openai
+loguru
+pyside6
+pyinstaller
+pyarmor
+pywin32
+apscheduler
+requests
+python-dotenv
