@@ -325,7 +325,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 800)
 
         # 设置窗口图标
-        icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons", "main.ico")
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "main.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
