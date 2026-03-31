@@ -148,7 +148,8 @@ def save_summary_to_file(group_name, summary, filename=None):
         os.makedirs(summary_dir, exist_ok=True)
 
     if not filename:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        # timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d")
         filename = os.path.join(summary_dir, f"{safe_name}聊天总结_{timestamp}.md")
     else:
         # 如果传入了 filename，确保它的父目录存在

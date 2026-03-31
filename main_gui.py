@@ -6,9 +6,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLabel, QLineEdit, QSpinBox, QPushButton,
                               QTextEdit, QComboBox, QMessageBox, QTabWidget,
                               QScrollArea, QFrame, QFileDialog, QCheckBox, QTimeEdit,
-                              QInputDialog, QDialog, QListWidget)
-from PySide6.QtCore import Signal, QThread, QTime
-from PySide6.QtGui import QIcon
+                              QInputDialog, QDialog, QListWidget, QSystemTrayIcon, QMenu)
+from PySide6.QtCore import Signal, QThread, QTime, Qt
+from PySide6.QtGui import QIcon, QAction
+import argparse # 用于处理启动参数
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # 导入 V3 核心逻辑
@@ -328,6 +329,9 @@ class MainWindow(QMainWindow):
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "main.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
+            self.icon = QIcon(icon_path)
+        else:
+            self.icon = QIcon()
 
         # 获取主程序 V3 所在的完整绝对路径，确保配置文件读写正确
         self.base_path = os.path.dirname(os.path.abspath(__file__))
@@ -343,7 +347,51 @@ class MainWindow(QMainWindow):
         self.apply_schedule()
 
         self.setup_ui()
+        self.setup_tray() # 初始化托盘
         ModernStyle.setup_widget(self)
+
+    def setup_tray(self):
+        """设置系统托盘"""
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.icon)
+
+        # 托盘菜单
+        tray_menu = QMenu()
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.showNormal)
+        quit_action = QAction("退出程序", self)
+        quit_action.triggered.connect(self.quit_app)
+
+        tray_menu.addAction(show_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger: # 单击
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.activateWindow()
+
+    def closeEvent(self, event):
+        """重写关闭事件，点击关闭按钮时隐藏到托盘"""
+        if self.tray_icon.isVisible():
+            self.hide()
+            event.ignore()
+            # 首次隐藏时弹出提示（可选）
+            # self.tray_icon.showMessage("运行中", "程序已最小化到系统托盘", QSystemTrayIcon.Information, 2000)
+        else:
+            event.accept()
+
+    def quit_app(self):
+        """真正退出程序"""
+        self.tray_icon.hide()
+        QApplication.quit()
 
     def load_configs(self):
         if not os.path.exists(self.config_dir):
@@ -751,7 +799,16 @@ class MainWindow(QMainWindow):
             self.scheduler.add_job(auto_scheduled_task, 'cron', hour=int(t[0]), minute=int(t[1]), args=[self.schedule_data['group'], 24, cfg, prompt, git_cfg], id='daily')
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="微信群聊总结助手")
+    parser.add_argument("--minimized", action="store_true", help="启动时最小化到系统托盘")
+    args = parser.parse_args()
+
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.show()
+
+    if args.minimized:
+        w.hide() # 启动时隐藏
+    else:
+        w.show() # 默认显示
+
     sys.exit(app.exec())
