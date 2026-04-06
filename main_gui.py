@@ -281,13 +281,14 @@ class SummaryWorker(QThread):
     error = Signal(str)
     status = Signal(str)  # 新增状态信号
 
-    def __init__(self, group_name, hours, mins, ai_config, prompt, limit=0):
+    def __init__(self, group_name, hours, mins, ai_config, prompt, limit=0, my_nickname=None):
         super().__init__()
         self.group_name = group_name
         self.duration = hours + (mins / 60.0)
         self.ai_config = ai_config
         self.prompt = prompt
         self.limit = limit
+        self.my_nickname = my_nickname
 
     def run(self):
         try:
@@ -301,8 +302,14 @@ class SummaryWorker(QThread):
             end = datetime.datetime.now().timestamp()
             start = end - (self.duration * 3600)
 
+            # 转换为 datetime 对象以便传递给总结函数
+            start_dt = datetime.datetime.fromtimestamp(start)
+            end_dt = datetime.datetime.fromtimestamp(end)
+
             if self.limit > 0:
                 msgs = fetch_chat_messages(group_id, start, end, limit=self.limit)
+                # 对手动限制条数的消息也进行升序排序
+                msgs.sort(key=lambda x: x.get("timestamp", 0))
                 self.status.emit(f"已获取 {len(msgs)} 条消息（限制 {self.limit} 条），正在调用 AI 生成总结...")
             else:
                 msgs = fetch_all_chat_messages(group_id, start, end)
@@ -312,7 +319,12 @@ class SummaryWorker(QThread):
                 self.error.emit("该时段内未发现有效的聊天消息")
                 return
 
-            res = generate_ai_summary(msgs, self.ai_config, self.prompt)
+            res = generate_ai_summary(msgs, self.ai_config, self.prompt, my_nickname=self.my_nickname, start_dt=start_dt, end_dt=end_dt)
+
+            # 核心逻辑：手动触发时，系统依然会在后台自动保存一份到默认的 summary/ 目录
+            if res and not res.startswith("生成总结时出错"):
+                save_summary_to_file(self.group_name, res)
+
             self.finished.emit(res)
         except Exception as e:
             self.error.emit(str(e))
@@ -322,7 +334,7 @@ class SummaryWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("微信群聊总结工具 v1.0")
+        self.setWindowTitle("微信群聊总结工具 v2.0")
         self.setMinimumSize(800, 800)
 
         # 设置窗口图标
@@ -339,6 +351,7 @@ class MainWindow(QMainWindow):
         self.ai_path = os.path.join(self.config_dir, "ai_config.json")
         self.prompt_path = os.path.join(self.config_dir, "prompts.json")
         self.schedule_path = os.path.join(self.config_dir, "schedule_config.json")
+        self.settings_path = os.path.join(self.config_dir, "settings.json")
         self.load_configs()
         self.prompt_mgr = PromptManager(self.prompt_path)
 
@@ -409,6 +422,12 @@ class MainWindow(QMainWindow):
         else:
             self.schedule_data = {"enabled": False, "group": "", "time": "09:00"}
 
+        if os.path.exists(self.settings_path):
+            with open(self.settings_path, 'r', encoding='utf-8') as f:
+                self.settings_data = json.load(f)
+        else:
+            self.settings_data = {"my_nickname": "", "default_export_path": ""}
+
     def setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -422,6 +441,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.create_ai_tab(), "AI服务配置")
         self.tabs.addTab(self.create_prompt_tab(), "提示词配置")
         self.tabs.addTab(self.create_schedule_tab(), "定时任务配置")
+        self.tabs.addTab(self.create_settings_tab(), "常规设置")
 
     def create_summary_tab(self):
         tab = QWidget()
@@ -499,6 +519,8 @@ class MainWindow(QMainWindow):
     def create_ai_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         self.ai_scroll_content = QWidget()
         self.ai_scroll_layout = QVBoxLayout(self.ai_scroll_content)
@@ -619,6 +641,69 @@ class MainWindow(QMainWindow):
 
     # --- Actions ---
 
+    def create_settings_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # 个人信息配置
+        nick_label = QLabel("个人信息")
+        nick_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(nick_label)
+
+        nick_group = QFrame()
+        nick_group.setStyleSheet(f"border: 1px solid {ModernStyle.BORDER}; border-radius: 4px; padding: 10px;")
+        nick_layout = QVBoxLayout(nick_group)
+
+        h_nick = QHBoxLayout()
+        h_nick.addWidget(QLabel("我的微信昵称:"))
+        self.nick_in = QLineEdit(self.settings_data.get('my_nickname', ''))
+        self.nick_in.setPlaceholderText("用于识别 @我 的消息")
+        h_nick.addWidget(self.nick_in)
+        nick_layout.addLayout(h_nick)
+        layout.addWidget(nick_group)
+
+        # 导出路径配置
+        path_label = QLabel("导出设置")
+        path_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(path_label)
+
+        path_group = QFrame()
+        path_group.setStyleSheet(f"border: 1px solid {ModernStyle.BORDER}; border-radius: 4px; padding: 10px;")
+        path_layout = QVBoxLayout(path_group)
+
+        h_path = QHBoxLayout()
+        h_path.addWidget(QLabel("默认导出目录:"))
+        self.path_in = QLineEdit(self.settings_data.get('default_export_path', ''))
+        self.path_in.setPlaceholderText("留空则使用程序目录下的 summary 文件夹")
+        h_path.addWidget(self.path_in)
+
+        path_btn = QPushButton("选择...")
+        path_btn.setFixedWidth(60)
+        path_btn.clicked.connect(self.on_select_path)
+        h_path.addWidget(path_btn)
+        path_layout.addLayout(h_path)
+        layout.addWidget(path_group)
+
+        layout.addStretch()
+        save_s = QPushButton("保存配置")
+        save_s.clicked.connect(self.on_save_settings)
+        layout.addWidget(save_s)
+        return tab
+
+    def on_select_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择默认导出根目录")
+        if path:
+            self.path_in.setText(path)
+
+    def on_save_settings(self):
+        self.settings_data['my_nickname'] = self.nick_in.text().strip()
+        self.settings_data['default_export_path'] = self.path_in.text().strip()
+        with open(self.settings_path, 'w', encoding='utf-8') as f:
+            json.dump(self.settings_data, f, ensure_ascii=False, indent=4)
+        QMessageBox.information(self, "成功", "设置已保存")
+
     def refresh_ai_combo(self):
         self.ai_combo.clear()
         self.ai_combo.addItems(self.ai_data.get('services', {}).keys())
@@ -632,6 +717,10 @@ class MainWindow(QMainWindow):
         self.ai_scroll_layout.addStretch()
 
     def on_generate(self):
+        # 防止重复点击：如果上一个 worker 还在运行，直接忽略
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            return
+
         group = self.group_in.text().strip()
         svc = self.ai_combo.currentText()
         if not group or not svc:
@@ -649,7 +738,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText("初始化中...")
         self.preview.setPlainText("")
 
-        cfg = self.ai_data['services'][svc]
+        cfg = self.ai_data['services'][svc].copy()
+
         # 安全获取提示词，防止为空崩溃
         prompt_content = ""
         if self.p_edit.toPlainText().strip():
@@ -667,7 +757,8 @@ class MainWindow(QMainWindow):
             self.reset_generate_button()
             return
 
-        self.worker = SummaryWorker(group, self.h_spin.value(), self.m_spin.value(), cfg, prompt_content, limit=self.limit_spin.value())
+        my_nickname = self.settings_data.get('my_nickname', '').strip()
+        self.worker = SummaryWorker(group, self.h_spin.value(), self.m_spin.value(), cfg, prompt_content, limit=self.limit_spin.value(), my_nickname=my_nickname)
 
         # 连接信号
         self.worker.status.connect(lambda s: self.status_label.setText(s))
@@ -692,9 +783,25 @@ class MainWindow(QMainWindow):
         self.gen_btn.setText("生成总结")
 
     def on_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出", f"{self.group_in.text()}_总结.md", "MD (*.md)")
+        # 业务逻辑：导出总结时，默认使用 settings.json 中的导出路径作为初始目录
+        default_dir = self.settings_data.get('default_export_path', '').strip()
+        if not default_dir or not os.path.exists(default_dir):
+            default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summary")
+
+        # 建议文件名
+        timestamp = datetime.datetime.now().strftime("%Y%m%d")
+        suggested_name = f"{self.group_in.text()}_总结_{timestamp}.md"
+
+        initial_path = os.path.join(default_dir, suggested_name)
+
+        path, _ = QFileDialog.getSaveFileName(self, "导出总结", initial_path, "Markdown (*.md)")
         if path:
-            with open(path, 'w', encoding='utf-8') as f: f.write(self.preview.toPlainText())
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.preview.toPlainText())
+                QMessageBox.information(self, "成功", f"总结已成功导出至：\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"导出失败：{e}")
 
     def on_add_service(self):
         d = AddServiceDialog(self)
@@ -786,17 +893,33 @@ class MainWindow(QMainWindow):
 
     def apply_schedule(self):
         self.scheduler.remove_all_jobs()
-        if self.schedule_data.get("enabled") and self.ai_data.get('services'):
-            t = self.schedule_data['time'].split(':')
-            svc_name = self.schedule_data.get("ai_service")
-            # 如果配置的服务不存在了，回退到第一个
-            if not svc_name or svc_name not in self.ai_data['services']:
-                svc_name = list(self.ai_data['services'].keys())[0]
+        if not (self.schedule_data.get("enabled") and self.ai_data.get('services') and self.prompt_mgr.prompts):
+            return
 
-            cfg = self.ai_data['services'][svc_name]
-            prompt = list(self.prompt_mgr.prompts.values())[0]
-            git_cfg = self.schedule_data.get("git_config")
-            self.scheduler.add_job(auto_scheduled_task, 'cron', hour=int(t[0]), minute=int(t[1]), args=[self.schedule_data['group'], 24, cfg, prompt, git_cfg], id='daily')
+        t = self.schedule_data['time'].split(':')
+        svc_name = self.schedule_data.get("ai_service")
+        # 如果配置的服务不存在了，回退到第一个
+        if not svc_name or svc_name not in self.ai_data['services']:
+            svc_name = list(self.ai_data['services'].keys())[0]
+
+        cfg = self.ai_data['services'][svc_name].copy()
+        my_nickname = self.settings_data.get('my_nickname', '')
+        prompt = list(self.prompt_mgr.prompts.values())[0]
+        git_cfg = self.schedule_data.get("git_config")
+
+        self.scheduler.add_job(
+            auto_scheduled_task, 'cron',
+            hour=int(t[0]), minute=int(t[1]),
+            kwargs={
+                'group_name': self.schedule_data['group'],
+                'duration_hours': 24,
+                'ai_config': cfg,
+                'prompt_template': prompt,
+                'git_config': git_cfg,
+                'my_nickname': my_nickname,
+            },
+            id='daily'
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="微信群聊总结助手")
