@@ -5,7 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "apscheduler>=3.11.2",
     "dotenv>=0.9.9",
-    "langchain>=1.2.15",
+    "loguru>=0.7.3",
+    "openai>=2.30.0",
+    "pyarmor>=9.2.4",
+    "pyinstaller>=6.19.0",
     "pyside6>=6.11.0",
+    "python-dotenv>=1.2.2",
+    "pywin32>=311",
+    "requests>=2.33.1",
 ]
