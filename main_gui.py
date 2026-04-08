@@ -15,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # 导入 V3 核心逻辑
 from wechat_summary import (resolve_group_id, fetch_chat_messages, fetch_all_chat_messages,
                                generate_ai_summary, save_summary_to_file,
-                               auto_scheduled_task)
+                               auto_scheduled_task, send_summary_to_wechat)
 
 class ModernStyle:
     BACKGROUND = "#ffffff"
@@ -289,6 +289,10 @@ class SummaryWorker(QThread):
         self.prompt = prompt
         self.limit = limit
         self.my_nickname = my_nickname
+        self.last_summary = ""
+        self.last_saved_path = None
+        self.last_start_dt = None
+        self.last_end_dt = None
 
     def run(self):
         try:
@@ -319,11 +323,12 @@ class SummaryWorker(QThread):
                 self.error.emit("该时段内未发现有效的聊天消息")
                 return
 
-            res = generate_ai_summary(msgs, self.ai_config, self.prompt, my_nickname=self.my_nickname, start_dt=start_dt, end_dt=end_dt)
+            self.last_start_dt = start_dt
+            self.last_end_dt = end_dt
 
-            # 核心逻辑：手动触发时，系统依然会在后台自动保存一份到默认的 summary/ 目录
-            if res and not res.startswith("生成总结时出错"):
-                save_summary_to_file(self.group_name, res)
+            res = generate_ai_summary(msgs, self.ai_config, self.prompt, my_nickname=self.my_nickname, start_dt=start_dt, end_dt=end_dt)
+            self.last_summary = res
+            self.last_saved_path = None
 
             self.finished.emit(res)
         except Exception as e:
@@ -335,7 +340,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("微信群聊总结工具 v2.0")
-        self.setMinimumSize(800, 800)
+        self.setMinimumSize(800, 850)
 
         # 设置窗口图标
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "main.ico")
@@ -419,8 +424,28 @@ class MainWindow(QMainWindow):
         if os.path.exists(self.schedule_path):
             with open(self.schedule_path, 'r', encoding='utf-8') as f:
                 self.schedule_data = json.load(f)
+            self.schedule_data.setdefault("git_config", {
+                "enabled": False,
+                "repo": "",
+                "token": "",
+                "branch": "main"
+            })
+            self.schedule_data.setdefault("wechat_config", {
+                "enabled": False,
+                "webhook_url": "",
+                "webhook_secret": ""
+            })
         else:
-            self.schedule_data = {"enabled": False, "group": "", "time": "09:00"}
+            self.schedule_data = {
+                "enabled": False,
+                "group": "",
+                "time": "09:00",
+                "wechat_config": {
+                    "enabled": False,
+                    "webhook_url": "",
+                    "webhook_secret": ""
+                }
+            }
 
         if os.path.exists(self.settings_path):
             with open(self.settings_path, 'r', encoding='utf-8') as f:
@@ -510,8 +535,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.preview)
 
         h_exp = QHBoxLayout()
-        exp_btn = QPushButton("导出总结"); exp_btn.clicked.connect(self.on_export)
-        h_exp.addStretch(); h_exp.addWidget(exp_btn)
+        self.wx_btn = QPushButton("推送至微信")
+        self.wx_btn.setEnabled(False)
+        self.wx_btn.clicked.connect(self.on_push_to_wechat)
+        h_exp.addStretch()
+        h_exp.addWidget(self.wx_btn)
+        self.export_btn = QPushButton("导出总结")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.on_export)
+        h_exp.addWidget(self.export_btn)
         layout.addLayout(h_exp)
 
         return tab
@@ -633,6 +665,37 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(git_group)
 
+        # 微信推送配置
+        wx_label = QLabel("微信推送配置 (可选)")
+        wx_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(wx_label)
+
+        wx_group = QFrame()
+        wx_group.setStyleSheet(f"border: 1px solid {ModernStyle.BORDER}; border-radius: 4px; padding: 10px;")
+        wx_layout = QVBoxLayout(wx_group)
+
+        wx_cfg = self.schedule_data.get("wechat_config", {})
+        self.wx_on = QCheckBox("启用定时总结后自动推送到微信")
+        self.wx_on.setChecked(wx_cfg.get("enabled", False))
+        wx_layout.addWidget(self.wx_on)
+
+        h_wx_url = QHBoxLayout()
+        h_wx_url.addWidget(QLabel("Webhook 地址:"))
+        self.wx_webhook_url = QLineEdit(wx_cfg.get("webhook_url", ""))
+        self.wx_webhook_url.setPlaceholderText("http://127.0.0.1:18731/hook/xxxx/send")
+        h_wx_url.addWidget(self.wx_webhook_url)
+        wx_layout.addLayout(h_wx_url)
+
+        h_wx_secret = QHBoxLayout()
+        h_wx_secret.addWidget(QLabel("Webhook 密钥:"))
+        self.wx_webhook_secret = QLineEdit(wx_cfg.get("webhook_secret", ""))
+        self.wx_webhook_secret.setEchoMode(QLineEdit.Password)
+        self.wx_webhook_secret.setPlaceholderText("请输入 Webhook 密钥")
+        h_wx_secret.addWidget(self.wx_webhook_secret)
+        wx_layout.addLayout(h_wx_secret)
+
+        layout.addWidget(wx_group)
+
         layout.addStretch()
         save_s = QPushButton("保存配置")
         save_s.clicked.connect(self.on_save_schedule)
@@ -657,9 +720,9 @@ class MainWindow(QMainWindow):
         nick_layout = QVBoxLayout(nick_group)
 
         h_nick = QHBoxLayout()
-        h_nick.addWidget(QLabel("我的微信昵称:"))
+        h_nick.addWidget(QLabel("我的微信昵称（默认昵称）:"))
         self.nick_in = QLineEdit(self.settings_data.get('my_nickname', ''))
-        self.nick_in.setPlaceholderText("用于识别 @我 的消息")
+        self.nick_in.setPlaceholderText("未设置群昵称时用于识别 @我，设置了群昵称的群会自动识别")
         h_nick.addWidget(self.nick_in)
         nick_layout.addLayout(h_nick)
         layout.addWidget(nick_group)
@@ -735,6 +798,8 @@ class MainWindow(QMainWindow):
         # 禁用按钮防止并发
         self.gen_btn.setEnabled(False)
         self.gen_btn.setText("正在生成...")
+        self.wx_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self.status_label.setText("初始化中...")
         self.preview.setPlainText("")
 
@@ -769,12 +834,17 @@ class MainWindow(QMainWindow):
     def on_summary_finished(self, result):
         self.preview.setPlainText(result)
         self.status_label.setText("总结生成完成")
+        is_valid_result = bool(result and not result.startswith("生成总结时出错"))
+        self.wx_btn.setEnabled(is_valid_result)
+        self.export_btn.setEnabled(is_valid_result)
         self.reset_generate_button()
 
     def on_summary_error(self, error_msg):
         QMessageBox.critical(self, "错误", error_msg)
         self.status_label.setText(f"执行失败: {error_msg}")
         self.preview.setPlainText("")
+        self.wx_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self.reset_generate_button()
 
     def reset_generate_button(self):
@@ -802,6 +872,39 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "成功", f"总结已成功导出至：\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败：{e}")
+
+    def on_push_to_wechat(self):
+        summary = self.preview.toPlainText().strip()
+        if not summary:
+            QMessageBox.warning(self, "提示", "请先生成总结后再推送到微信")
+            return
+
+        wechat_cfg = self.schedule_data.get("wechat_config", {})
+        webhook_url = wechat_cfg.get("webhook_url", "").strip()
+        webhook_secret = wechat_cfg.get("webhook_secret", "").strip()
+        if not webhook_url or not webhook_secret:
+            QMessageBox.warning(self, "提示", "请先在定时任务配置页填写微信 Webhook 地址和密钥")
+            return
+
+        if not hasattr(self, 'worker') or not getattr(self.worker, 'last_start_dt', None) or not getattr(self.worker, 'last_end_dt', None):
+            QMessageBox.warning(self, "提示", "缺少本次总结的时间范围信息，请重新生成后再推送")
+            return
+
+        pushed = send_summary_to_wechat(
+            group_name=self.group_in.text().strip(),
+            summary=summary,
+            webhook_url=webhook_url,
+            webhook_secret=webhook_secret,
+            trigger_mode="manual",
+            start_dt=self.worker.last_start_dt,
+            end_dt=self.worker.last_end_dt,
+            saved_path=getattr(self.worker, 'last_saved_path', None),
+        )
+
+        if pushed:
+            QMessageBox.information(self, "成功", "已推送到微信")
+        else:
+            QMessageBox.warning(self, "失败", "推送到微信失败，请检查 Webhook 配置或服务状态")
 
     def on_add_service(self):
         d = AddServiceDialog(self)
@@ -884,12 +987,17 @@ class MainWindow(QMainWindow):
                 "repo": self.git_repo.text().strip(),
                 "token": self.git_token.text().strip(),
                 "branch": self.git_branch.text().strip() or "main"
+            },
+            "wechat_config": {
+                "enabled": self.wx_on.isChecked(),
+                "webhook_url": self.wx_webhook_url.text().strip(),
+                "webhook_secret": self.wx_webhook_secret.text().strip(),
             }
         }
         with open(self.schedule_path, 'w', encoding='utf-8') as f:
             json.dump(self.schedule_data, f, ensure_ascii=False, indent=4)
         self.apply_schedule()
-        QMessageBox.information(self, "成功", "定时任务及 Git 配置已更新")
+        QMessageBox.information(self, "成功", "定时任务、GitHub 与微信推送配置已更新")
 
     def apply_schedule(self):
         self.scheduler.remove_all_jobs()
@@ -906,6 +1014,7 @@ class MainWindow(QMainWindow):
         my_nickname = self.settings_data.get('my_nickname', '')
         prompt = list(self.prompt_mgr.prompts.values())[0]
         git_cfg = self.schedule_data.get("git_config")
+        wechat_cfg = self.schedule_data.get("wechat_config")
 
         self.scheduler.add_job(
             auto_scheduled_task, 'cron',
@@ -917,6 +1026,7 @@ class MainWindow(QMainWindow):
                 'prompt_template': prompt,
                 'git_config': git_cfg,
                 'my_nickname': my_nickname,
+                'wechat_config': wechat_cfg,
             },
             id='daily'
         )

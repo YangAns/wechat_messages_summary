@@ -28,6 +28,90 @@ import subprocess
 CREATE_NO_WINDOW = 0x08000000
 
 
+class WeChatNotifier:
+    """微信 webhook 通知器"""
+
+    def __init__(self, webhook_url: str, webhook_secret: str):
+        self.webhook_url = webhook_url
+        self.webhook_secret = webhook_secret
+
+    def send_message(self, text: str) -> bool:
+        if not self.webhook_url or not self.webhook_secret:
+            logger.warning("微信 Webhook 配置不完整，跳过通知")
+            return False
+
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-Webhook-Secret": self.webhook_secret,
+            }
+            payload = {"text": text}
+            response = requests.post(
+                self.webhook_url,
+                json=payload,
+                headers=headers,
+                timeout=10,
+            )
+            if response.status_code == 200:
+                logger.info("微信通知发送成功")
+                return True
+            logger.error(f"微信通知发送失败: HTTP {response.status_code} - {response.text}")
+            return False
+        except requests.exceptions.Timeout:
+            logger.error("微信通知发送超时")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"微信通知发送失败: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"发送微信通知时发生错误: {e}")
+            return False
+
+
+def build_wechat_summary_message(group_name, summary, trigger_mode, start_dt=None, end_dt=None, saved_path=None, git_pushed=None):
+    """构建微信通知内容"""
+    trigger_text = "手动生成" if trigger_mode == "manual" else "定时任务"
+    lines = [f"✅ 群聊总结已生成", f"群聊: {group_name}", f"触发方式: {trigger_text}"]
+
+    if start_dt and end_dt:
+        lines.append(f"时间范围: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}")
+
+    if git_pushed is True:
+        lines.append("GitHub 推送: 成功")
+    elif git_pushed is False:
+        lines.append("GitHub 推送: 失败")
+
+    full_content = (summary or "").replace("\r\n", "\n").replace("\r", "\n")
+    full_content = re.sub(r"\n{3,}", "\n\n", full_content).strip()
+
+    if full_content:
+        lines.append("")
+        lines.append("总结内容:")
+        lines.append(full_content)
+
+    return "\n".join(lines)
+
+
+def send_summary_to_wechat(group_name, summary, webhook_url, webhook_secret, trigger_mode, start_dt=None, end_dt=None,
+                           saved_path=None, git_pushed=None):
+    """发送总结结果到微信 webhook"""
+    if not webhook_url or not webhook_secret:
+        logger.info("未配置微信 Webhook，跳过推送")
+        return False
+
+    message = build_wechat_summary_message(
+        group_name=group_name,
+        summary=summary,
+        trigger_mode=trigger_mode,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        saved_path=saved_path,
+        git_pushed=git_pushed,
+    )
+    notifier = WeChatNotifier(webhook_url, webhook_secret)
+    return notifier.send_message(message)
+
+
 def resolve_group_id(keyword):
     """通过关键字搜索获取群聊 ID (username)，要求群名完全匹配"""
     endpoint = f"{BASE_API_URL}/contacts"
@@ -106,8 +190,15 @@ def generate_ai_summary(messages, ai_config, prompt_template, my_nickname=None, 
     if not ai_config:
         return "未配置 AI 服务。"
 
-    # 使用传入的昵称，用于识别 @ 消息
-    mention_tag = f"@{my_nickname}" if my_nickname else None
+    candidate_names = set()
+    if my_nickname and my_nickname.strip():
+        candidate_names.add(my_nickname.strip())
+    for msg in messages:
+        group_nickname = (msg.get("groupNickName") or "").strip()
+        if group_nickname:
+            candidate_names.add(group_nickname)
+    mention_tags = [f"@{name}" for name in candidate_names]
+    candidate_names_text = "、".join(sorted(candidate_names))
 
     # 时间段信息标注
     time_info = ""
@@ -122,10 +213,9 @@ def generate_ai_summary(messages, ai_config, prompt_template, my_nickname=None, 
         content = msg.get("content") or ""
         ts = msg.get("timestamp", 0)
 
-        # 识别是否提到我 (仅在配置了昵称时进行匹配)
-        is_mention_me = False
-        if mention_tag and mention_tag in content:
-            is_mention_me = True
+        # 识别是否提到我（同时支持微信昵称和当前群昵称）
+        is_mention_me = bool(content and any(tag in content for tag in mention_tags))
+        if is_mention_me:
             mention_found = True
 
         # 将时间戳转换为 HH:mm 格式
@@ -161,19 +251,20 @@ def generate_ai_summary(messages, ai_config, prompt_template, my_nickname=None, 
         if time_info:
             system_prompt += f"\n\n注意：当前处理的对话发生在以下时间段：{time_info.strip()}"
 
-        # 强化对提到我的消息关注（仅在配置了昵称且发现提及的情况下）
-        if mention_found and my_nickname:
+        # 强化对提到我的消息关注（同时支持微信昵称和群昵称）
+        if mention_found and candidate_names:
             system_prompt += f"""
 \n\n**重要补充指令**：
-1. 本次聊天记录中有人 @了用户（{my_nickname}），这些消息在正文中已被标记为 '[提到我]'。
-2. 请在输出文档的**最后部分（末尾）**，增加一个名为 '📌 与我相关 / 待办事项' 的专门章节。
-3. 在该章节中，详细列出谁在什么时间提到或询问了 {my_nickname}，具体内容是什么。
-4. 如果该消息暗示了需要 {my_nickname} 执行的任务，请以待办列表的形式清晰呈现。
+1. 本次聊天记录中有人 @了用户，这些消息在正文中已被标记为 '[提到我]'。
+2. 用户在本群中可能被称呼为：{candidate_names_text}。
+3. 请在输出文档的**最后部分（末尾）**，增加一个名为 '📌 与我相关 / 待办事项' 的专门章节。
+4. 在该章节中，详细列出谁在什么时间提到或询问了用户，具体内容是什么。
+5. 如果该消息暗示了需要用户执行的任务，请以待办列表的形式清晰呈现。
 """
-        elif not my_nickname:
+        elif not candidate_names:
             system_prompt += "\n\n提示：总结时请保持客观中立的视角。由于未配置特定用户身份，无需生成 '与我相关' 的专项章节。"
         else:
-            system_prompt += f"\n\n注意：虽然本次对话中没有直接提及 {my_nickname}，但仍请留意是否有与该用户职责或关注点相关的隐含内容。"
+            system_prompt += f"\n\n注意：用户在本群中可能被称呼为：{candidate_names_text}。虽然本次对话中没有直接提及这些称呼，但仍请留意是否有与该用户职责或关注点相关的隐含内容。"
 
         completion = client.chat.completions.create(
             model=ai_config.get('model', 'qwen-plus'),
@@ -184,10 +275,10 @@ def generate_ai_summary(messages, ai_config, prompt_template, my_nickname=None, 
         )
         result = completion.choices[0].message.content
 
-        # 后处理：如果配置了昵称，将文档中的昵称替换为”我”，增强第一视角感
-        # 使用正则匹配独立词汇，避免误伤包含昵称子串的其他词
-        if my_nickname and result:
-            result = re.sub(rf'(?<!\w){re.escape(my_nickname)}(?!\w)', '\u6211', result)
+        # 后处理：将候选昵称统一替换为“我”，增强第一视角感
+        if result:
+            for name in sorted(candidate_names, key=len, reverse=True):
+                result = re.sub(rf'(?<!\w){re.escape(name)}(?!\w)', '\u6211', result)
 
         return result
     except Exception as e:
@@ -288,7 +379,8 @@ def git_push_file(file_path, repo_url, token, branch="main"):
         return False
 
 
-def auto_scheduled_task(group_name, duration_hours, ai_config, prompt_template, git_config=None, my_nickname=None):
+def auto_scheduled_task(group_name, duration_hours, ai_config, prompt_template, git_config=None, my_nickname=None,
+                        wechat_config=None):
     """定时任务执行逻辑"""
     logger.info(f"开始执行定时任务: {group_name}")
 
@@ -318,13 +410,27 @@ def auto_scheduled_task(group_name, duration_hours, ai_config, prompt_template, 
     filename = os.path.join(current_dir, "summary", safe_name, f"{safe_name}聊天总结_{timestamp_str}.md")
 
     saved_path = save_summary_to_file(group_name, summary, filename)
+    git_pushed = None
 
     if saved_path and git_config and git_config.get("enabled"):
-        git_push_file(
+        git_pushed = git_push_file(
             saved_path,
             git_config.get("repo"),
             git_config.get("token"),
             git_config.get("branch", "main")
+        )
+
+    if saved_path and wechat_config and wechat_config.get("enabled"):
+        send_summary_to_wechat(
+            group_name=group_name,
+            summary=summary,
+            webhook_url=wechat_config.get("webhook_url", ""),
+            webhook_secret=wechat_config.get("webhook_secret", ""),
+            trigger_mode="schedule",
+            start_dt=start_time,
+            end_dt=end_time,
+            saved_path=saved_path,
+            git_pushed=git_pushed,
         )
 
     logger.info(f"定时任务完成: {group_name}")
