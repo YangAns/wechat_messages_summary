@@ -21,11 +21,18 @@ logger.add(
 )
 
 BASE_API_URL = os.environ["BASE_API_URL"]
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 
 import subprocess
 
 # Windows 专用：隐藏命令行窗口标志
 CREATE_NO_WINDOW = 0x08000000
+
+
+def get_weflow_headers():
+    if not ACCESS_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {ACCESS_TOKEN}"}
 
 
 class WeChatNotifier:
@@ -68,7 +75,8 @@ class WeChatNotifier:
             return False
 
 
-def build_wechat_summary_message(group_name, summary, trigger_mode, start_dt=None, end_dt=None, saved_path=None, git_pushed=None):
+def build_wechat_summary_message(group_name, summary, trigger_mode, start_dt=None, end_dt=None, saved_path=None,
+                                 git_pushed=None):
     """构建微信通知内容"""
     trigger_text = "手动生成" if trigger_mode == "manual" else "定时任务"
     lines = [f"✅ 群聊总结已生成", f"群聊: {group_name}", f"触发方式: {trigger_text}"]
@@ -117,7 +125,7 @@ def resolve_group_id(keyword):
     endpoint = f"{BASE_API_URL}/contacts"
     try:
         params = {"keyword": keyword}
-        response = requests.get(endpoint, params=params, timeout=10)
+        response = requests.get(endpoint, params=params, headers=get_weflow_headers(), timeout=10)
         if response.status_code == 200:
             data = response.json()
             # 根据 API 文档，联系人列表在 data["contacts"] 中
@@ -152,7 +160,7 @@ def fetch_chat_messages(talker_id, start_ts, end_ts, limit=100, offset=0):
             "limit": limit,
             "offset": offset,
         }
-        response = requests.get(endpoint, params=params, timeout=30)
+        response = requests.get(endpoint, params=params, headers=get_weflow_headers(), timeout=30)
         if response.status_code == 200:
             data = response.json()
             return data.get("messages", [])
@@ -253,14 +261,19 @@ def generate_ai_summary(messages, ai_config, prompt_template, my_nickname=None, 
 
         # 强化对提到我的消息关注（同时支持微信昵称和群昵称）
         if mention_found and candidate_names:
+            # system_prompt += f"""
+            #             \n\n**重要补充指令**：
+            #             1. 本次聊天记录中有人 @了用户，这些消息在正文中已被标记为 '[提到我]'。
+            #             2. 用户在本群中可能被称呼为：{candidate_names_text}。
+            #             3. 请在输出文档的**最后部分（末尾）**，增加一个名为 '📌 与我相关 / 待办事项' 的专门章节。
+            #             4. 在该章节中，详细列出谁在什么时间提到或询问了用户，具体内容是什么。
+            #             5. 如果该消息暗示了需要用户执行的任务，请以待办列表的形式清晰呈现。
+            #         """
             system_prompt += f"""
-\n\n**重要补充指令**：
-1. 本次聊天记录中有人 @了用户，这些消息在正文中已被标记为 '[提到我]'。
-2. 用户在本群中可能被称呼为：{candidate_names_text}。
-3. 请在输出文档的**最后部分（末尾）**，增加一个名为 '📌 与我相关 / 待办事项' 的专门章节。
-4. 在该章节中，详细列出谁在什么时间提到或询问了用户，具体内容是什么。
-5. 如果该消息暗示了需要用户执行的任务，请以待办列表的形式清晰呈现。
-"""
+                              \n\n**重要补充指令**：
+                              1. 本次聊天记录中有人 @了用户，这些消息在正文中已被标记为 '[提到我]'。
+                              2. 用户在本群中可能被称呼为：{candidate_names_text}。
+                          """
         elif not candidate_names:
             system_prompt += "\n\n提示：总结时请保持客观中立的视角。由于未配置特定用户身份，无需生成 '与我相关' 的专项章节。"
         else:
